@@ -484,3 +484,29 @@ app.post('/api/certificates/issue', requireAuth, async (req, res) => {
 // ── START SERVER ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`IELTScoreUp API running on port ${PORT}`));
+
+// ── SPEAKING TRANSCRIBE (Whisper) ─────────────────────────────
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post('/api/speaking/transcribe', requireAuth, upload.single('audio'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No audio file' });
+  try {
+    const FormData = require('form-data');
+    const form = new FormData();
+    form.append('file', req.file.buffer, { filename: 'audio.webm', contentType: req.file.mimetype });
+    form.append('model', 'whisper-1');
+    form.append('language', 'en');
+
+    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, ...form.getHeaders() },
+      body: form
+    });
+
+    const data = await response.json();
+    res.json({ text: data.text || '' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
