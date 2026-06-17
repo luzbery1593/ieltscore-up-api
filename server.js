@@ -44,12 +44,16 @@ const generalLimiter = rateLimit({
   message: { error: 'Too many requests. Please try again in a few minutes.' }
 });
 
-// Tighter cap specifically for endpoints that call Anthropic/OpenAI (real cost per call)
+// Tighter cap specifically for endpoints that call Anthropic/OpenAI (real cost per call).
+// Keyed by authenticated user (falls back to IP) so one shared office/dev IP doesn't
+// exhaust the quota for everyone, and so it scales with one real exam = several AI calls
+// (generate + tts + up to 3 transcriptions + report).
 const aiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 30,
+  limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => (req.user && req.user.id) || req.ip,
   message: { error: 'Too many AI requests. Please wait a few minutes and try again.' }
 });
 
@@ -425,10 +429,17 @@ Use fresh, varied topics. Never repeat common IELTS examples.`,
 });
 
 // ── GRAMMAR GENERATE (content generation → Haiku) ──────────────
+const GRAMMAR_TOPICS = ['present perfect vs past simple', 'conditional sentences', 'passive voice in academic writing', 'relative clauses', 'modal verbs for speculation', 'reported speech', 'articles', 'discourse markers and cohesion', 'comparison structures', 'gerunds and infinitives', 'noun clauses', 'subject-verb agreement', 'parallel structure', 'mixed conditionals', 'academic hedging language'];
+
 app.post('/api/grammar/generate', requireAuth, aiLimiter, async (req, res) => {
-  const { level, topic } = req.body;
-  const missing = missingFields(req.body, ['level', 'topic']);
+  const missing = missingFields(req.body, ['level']);
   if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
+
+  const { level } = req.body;
+  // topic is optional — the frontend has a "Random" option that sends an empty topic on purpose
+  const topic = (req.body.topic && String(req.body.topic).trim())
+    ? req.body.topic
+    : GRAMMAR_TOPICS[Math.floor(Math.random() * GRAMMAR_TOPICS.length)];
 
   try {
     const message = await anthropic.messages.create({
@@ -490,9 +501,12 @@ app.post('/api/grammar/report', requireAuth, aiLimiter, async (req, res) => {
 });
 
 // ── MOCK EXAM — GENERATE FULL EXAM (content generation → Haiku) ─
-// NOTE: response shape was inferred from mock-exam.html's render functions
-// (examData.listening / .reading / .writing / .speaking). Verify field names
-// against the frontend once we get to the frontend fixes and adjust if needed.
+// Generates listening / reading / writing / speaking as 4 separate, simpler
+// Anthropic calls run in parallel — reusing the same proven prompts as the
+// standalone endpoints — instead of one giant combined JSON. Asking a single
+// Haiku call for four different complex structures at once was unreliable:
+// it would often produce valid JSON for the first section(s) and truncate or
+// malform the rest, so only part of the exam ever rendered.
 app.post('/api/mock/generate', requireAuth, aiLimiter, async (req, res) => {
   const { examType } = req.body;
   if (!examType || !['Academic', 'General Training'].includes(examType)) {
@@ -505,31 +519,48 @@ app.post('/api/mock/generate', requireAuth, aiLimiter, async (req, res) => {
   const listeningScenario = LISTENING_TOPICS[listeningSection][Math.floor(Math.random() * LISTENING_TOPICS[listeningSection].length)];
 
   try {
-    const message = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 3500,
-      system: `You are an IELTS examiner generating a full mock ${examType} exam. Return ONLY valid JSON, no markdown, with exactly this shape:
-{
-  "listening": {"title":"Short title","description":"One sentence","badge":"e.g. Everyday conversation · 2 speakers","speakers":[{"name":"Name","accent":"british","gender":"female"}],"transcript":"${LISTENING_SECTION_GUIDE[listeningSection]} 220-260 words. Natural spoken English with contractions.","questions":[{"type":"fill","text":"...","answer":"..."},{"type":"mcq","text":"...","options":["A. ...","B. ...","C. ...","D. ..."],"answer":"A. ..."}]},
-  "reading": {"title":"Passage title","passage":"380-420 words. Use HTML <p> tags. Start each paragraph with <span class='para-lbl'>A</span> etc.","questions":[{"type":"tfng","text":"...","answer":"TRUE"},{"type":"mcq","text":"...","options":["A. ...","B. ...","C. ...","D. ..."],"answer":"B. ..."},{"type":"fill","text":"...","answer":"..."}]},
-  "writing": {
-    "task1": {"prompt": "${examType === 'Academic' ? 'A Task 1 prompt describing a chart/graph/table — include the actual data written out in the prompt text itself, since no image will be shown.' : 'A Task 1 prompt asking the student to write a letter (formal/semi-formal/informal) about a everyday situation.'}", "time": "20 minutes", "minWords": 150},
-    "task2": {"prompt": "A Task 2 essay prompt on a fresh, varied topic.", "time": "40 minutes", "minWords": 250}
-  },
-  "speaking": {
-    "part1": {"question": "Personal interview question about a familiar topic", "sub": "Follow-up question"},
-    "part2": {"topic": "Describe a...", "bullets": ["point 1","point 2","point 3","point 4"], "note": "You will have 1 minute to prepare..."},
-    "part3": {"question": "Abstract discussion question related to Part 2 topic", "sub": "Optional follow-up"}
-  }
-}
-Listening: include exactly 5 questions (3 fill, 2 mcq), answers must come directly from the transcript.
-Reading: include exactly 8 questions (3 tfng, 3 mcq, 2 fill), answers must come directly from the passage.
-Use fresh, varied topics — never repeat common textbook examples.`,
-      messages: [{ role: 'user', content: `Generate a full ${examType} mock exam.\nListening scenario: ${listeningScenario}\nReading topic: ${readingTopic}` }]
-    });
+    const [listeningMsg, readingMsg, writingMsg, speakingMsg] = await Promise.all([
+      anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1200,
+        system: `You are an IELTS Listening examiner writing a Section ${listeningSection} audio script. Return ONLY valid JSON, no markdown:
+{"title":"Short title","description":"One sentence","badge":"e.g. Everyday conversation · 2 speakers","speakers":[{"name":"Name","accent":"british","gender":"female"}],"transcript":"${LISTENING_SECTION_GUIDE[listeningSection]} 220-260 words. Natural spoken English with contractions.","questions":[{"type":"fill","text":"The surname is _____.","answer":"exact word from transcript"},{"type":"mcq","text":"Question?","options":["A. option","B. option","C. option","D. option"],"answer":"A. option"}]}
+Include exactly 5 questions (3 fill, 2 mcq). Every answer must come directly from the transcript.`,
+        messages: [{ role: 'user', content: `Write a Section ${listeningSection} listening exercise about: ${listeningScenario}` }]
+      }),
+      anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1800,
+        system: `You are an IELTS examiner. Generate an IELTS ${examType} Reading passage with questions. Return ONLY valid JSON, no markdown:
+{"title":"Passage title","passage":"Passage of 380-420 words. Use HTML <p> tags. Start each paragraph with <span class='para-lbl'>A</span> <span class='para-lbl'>B</span> etc. Formal style with specific facts.","questions":[{"type":"tfng","text":"Statement","answer":"TRUE"},{"type":"mcq","text":"Question","options":["A. opt","B. opt","C. opt","D. opt"],"answer":"B. opt"},{"type":"fill","text":"Complete: The _____ was...","answer":"word"}]}
+Include exactly 8 questions: 3 tfng, 3 mcq, 2 fill. All answers must come directly from the passage.`,
+        messages: [{ role: 'user', content: `Write a ${examType} reading passage about: ${readingTopic}` }]
+      }),
+      anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 600,
+        system: `You are an IELTS examiner. Generate Writing Task 1 and Task 2 prompts for a full ${examType} mock exam. Return ONLY JSON:
+{"task1": {"prompt": "Full prompt text exactly as it would appear in the exam", "time": "20 minutes", "minWords": 150}, "task2": {"prompt": "Full prompt text", "time": "40 minutes", "minWords": 250}}
+${examType === 'Academic' ? 'Task 1 must describe a chart/graph/table — write the actual data directly into the prompt text itself, since no image will be shown.' : 'Task 1 must ask the student to write a letter (formal/semi-formal/informal) about an everyday situation.'}
+Use a fresh, varied Task 2 topic. Never repeat common examples.`,
+        messages: [{ role: 'user', content: `Generate Task 1 and Task 2 writing prompts for a ${examType} mock exam. Be creative.` }]
+      }),
+      anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 700,
+        system: `You are an IELTS examiner. Generate a full 3-part Speaking test for a mock exam. Return ONLY JSON:
+{"part1": {"question": "Personal interview question about a familiar topic", "sub": "Follow-up or clarification"}, "part2": {"topic": "Describe a...", "bullets": ["point 1", "point 2", "point 3", "point 4"], "note": "You will have 1 minute to prepare..."}, "part3": {"question": "Abstract discussion question", "sub": "Optional follow-up"}}
+Part 3 should relate to the Part 2 topic. Use fresh, varied topics. Never repeat common IELTS examples.`,
+        messages: [{ role: 'user', content: 'Generate a full 3-part speaking test (Part 1, Part 2 cue card, Part 3) for a mock exam. Be creative.' }]
+      })
+    ]);
 
-    const result = parseAIJson(message.content[0].text);
-    res.json(result);
+    res.json({
+      listening: parseAIJson(listeningMsg.content[0].text),
+      reading: parseAIJson(readingMsg.content[0].text),
+      writing: parseAIJson(writingMsg.content[0].text),
+      speaking: parseAIJson(speakingMsg.content[0].text)
+    });
   } catch (e) {
     sendError(res, 'mock/generate', e);
   }
