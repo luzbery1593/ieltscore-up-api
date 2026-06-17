@@ -8,6 +8,11 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
+// Railway (and most PaaS) sit behind a reverse proxy that sets X-Forwarded-For.
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// because it can't safely trust that header to identify the real client IP.
+app.set('trust proxy', 1);
+
 // ── CORS ────────────────────────────────────────────────────
 // Configure ALLOWED_ORIGINS in Railway as a comma-separated list, e.g.:
 // ALLOWED_ORIGINS=https://ieltscoreup.com,https://www.ieltscoreup.com
@@ -69,8 +74,43 @@ function sendError(res, context, e, status = 500) {
   res.status(status).json({ error: 'Something went wrong. Please try again.' });
 }
 
+// Extracts the first complete, balanced JSON value (object or array) from a string,
+// ignoring any extra text/duplicate JSON that may follow it.
+function extractFirstJsonValue(text) {
+  const start = text.search(/[{[]/);
+  if (start === -1) return text;
+  const openChar = text[start];
+  const closeChar = openChar === '{' ? '}' : ']';
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === openChar) depth++;
+    else if (ch === closeChar) {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start); // unbalanced — return what we have and let JSON.parse report it
+}
+
 function parseAIJson(text) {
-  return JSON.parse(text.trim().replace(/```json|```/g, '').trim());
+  const cleaned = text.trim().replace(/```json|```/g, '').trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    // The model sometimes appends extra text or a second JSON object after a valid one.
+    // Fall back to extracting just the first balanced JSON value before giving up.
+    return JSON.parse(extractFirstJsonValue(cleaned));
+  }
 }
 
 function missingFields(body, fields) {
